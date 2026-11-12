@@ -8,17 +8,23 @@ The rules, in order, on every batch:
     stepped once per batch, in a module-level variable. Nothing else carries state between batches
     but that EMA, the batch counter and the entry price, so a replayed dataset gives byte-identical
     action logs.
-2.  The batch counter counts the batches this bot has answered (0 on the first one). No wall clock
-    is ever read.
-3.  On the first batch it sends one small buy, 20 USDC of notional at 100 bps of slippage: the
-    contest needs at least one trade, so the bot always has one even if the trend never shows up.
-4.  From the 30th batch on, while the position counts as empty (worth less than 1% of equity, so
-    the leftovers of the insurance ticket do not count), it buys when the last close is more than
-    10 bps above the EMA. The buy spends the cash, but its weight is capped by weight_room (100% of
-    equity) with 1% kept back as a margin, and an amount under 1 USDC is not sent at all.
+2.  A warm-up batch (state.warming_up, the first state.warmup_bars batches) only feeds the EMA: no
+    order is sent on one, so the history is there before the scored window opens. The batch counter
+    counts the tradeable batches only (0 on the first one, the batch whose seq is warmup_bars). No
+    wall clock is ever read.
+3.  On the first tradeable batch it sends one small buy, 20 USDC of notional at 100 bps of
+    slippage: the contest needs at least one trade, so the bot always has one even if the trend
+    never shows up.
+4.  From the 30th tradeable batch on, while the position counts as empty (worth less than 1% of
+    equity, so the leftovers of the insurance ticket do not count), it buys when the last close is
+    more than 10 bps above the EMA. The buy spends the cash, but its weight is capped by weight_room
+    (100% of equity) with 1% kept back as a margin, and an amount under 1 USDC is not sent at all.
 5.  While a real position is held it sells all of it when the close falls below the EMA, or when it
     falls 100 bps below the price the entry was decided on (stop-loss).
 6.  After an exit the rules above are free to enter again, so the bot may round-trip many times.
+7.  An equity brake: the equity the first bar showed is remembered, and once equity has fallen to
+    90% of it or less the bot opens no new position for the rest of the run. A position it already
+    holds is still sold by rule 5, so the brake never traps the bot in the drawdown.
 
 Everything is decided from the bars the harness has already sent. The stdlib only.
 """
@@ -54,11 +60,16 @@ MAX_SLIPPAGE_BPS = 100
 REAL_POSITION_BPS = 100
 #: The margin kept under the 100% weight cap, a 100th of the room.
 WEIGHT_MARGIN_DIVISOR = 100
+#: The equity brake trips once equity is down to this share of the first bar's equity (90%).
+EQUITY_BRAKE_BPS = 9_000
 
-#: Strategy state: the EMA, the batches answered, and the close the entry was decided on.
+#: Strategy state: the EMA, the tradeable batches answered, the close the entry was decided on, the
+#: equity the first bar showed and whether the equity brake has tripped.
 _ema = None
 _batches = 0
 _entry_price = None
+_start_equity = None
+_braked = False
 
 
 def _held_qty(state):
@@ -80,24 +91,37 @@ def _held_qty(state):
 
 def on_batch(state, batch):
     """The orders decided on this bar: at most one, a sell or a buy (or none)."""
-    global _ema, _batches, _entry_price
+    global _ema, _batches, _entry_price, _start_equity, _braked
 
     close = state.close(SYMBOL)
     if close is None:
         # No CBBTC bar yet (a gap at the window's start): nothing to read, nothing decided.
         return []
 
-    # 1. The EMA, seeded with the first close and stepped once per batch.
+    # 1. The EMA, seeded with the first close and stepped once per batch, warm-up ones included.
     if _ema is None:
         _ema = float(close)
     else:
         _ema = _ema + EMA_ALPHA * (float(close) - _ema)
 
-    # 2. How many batches have been answered before this one.
+    equity = state.equity
+    if _start_equity is None:
+        # 7. The equity the first bar showed, the reference of the brake.
+        _start_equity = equity
+
+    # 2a. A warm-up bar builds the history and nothing else: every order decided on one is rejected.
+    if state.warming_up:
+        return []
+
+    # 2. How many tradeable batches have been answered before this one (0 on the first).
     n = _batches
     _batches += 1
 
-    equity = state.equity
+    # 7. Once equity is down to 90% of the first bar's, no new position is opened for the rest of
+    # the run. The latch stays on: the brake never re-opens. Exits below still run.
+    if _start_equity > 0 and equity * BPS <= _start_equity * EQUITY_BRAKE_BPS:
+        _braked = True
+
     qty = _held_qty(state)
     value = state.value(SYMBOL, qty) if qty else 0
     real = value * BPS >= equity * REAL_POSITION_BPS
@@ -109,7 +133,10 @@ def on_batch(state, batch):
             return [{"side": "sell", "symbol": SYMBOL, "qty": qty, "max_slippage_bps": MAX_SLIPPAGE_BPS}]
         return []
 
-    # 3. The insurance ticket, on the very first batch.
+    if _braked:
+        return []
+
+    # 3. The insurance ticket, on the very first tradeable batch.
     if n == 0:
         return [{"side": "buy", "symbol": SYMBOL, "notional_quote_units": INSURANCE_NOTIONAL, "max_slippage_bps": MAX_SLIPPAGE_BPS}]
 

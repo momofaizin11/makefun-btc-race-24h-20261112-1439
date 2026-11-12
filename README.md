@@ -27,6 +27,16 @@ replies byte for byte.
 * **Re-entry.** After an exit the entry rule is free to fire again, so the bot may round-trip many
   times.
 
+Two safety rules sit around those:
+
+* **Warm-up.** A contest may open with warm-up bars before the scored window. On those the bot
+  sends nothing, but the EMA and the last close are still updated, so the history is built by the
+  time trading opens; the batch counter starts at the first tradeable batch (seq `warmup_bars`), so
+  the insurance ticket and the 30-batch entry threshold are counted from there, not from batch 0.
+* **Equity brake.** The equity the first bar showed is remembered, and once equity has fallen to 90%
+  of it or less the bot stops opening new positions for the rest of the run, while a position it
+  already holds is still sold by the usual exit rule.
+
 Sells and buys both cap slippage at 100 bps; at most one order is sent per batch, and no order is
 sent when the amount would be under the 1 USDC minimum notional.
 
